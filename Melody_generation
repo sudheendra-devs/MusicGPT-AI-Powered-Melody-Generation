@@ -1,0 +1,262 @@
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+from torch.optim import AdamW
+from tqdm import tqdm
+import random
+import numpy as np
+import torch.nn.functional as F
+from Levenshtein import distance as levenshtein_distance
+
+# Hyperparameters
+batch_size = 64
+block_size = 256
+max_iters = 2500
+eval_interval = 500
+learning_rate = 3e-4
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+eval_iters = 200
+n_embd = 128
+n_head = 3
+n_layer = 3
+dropout = 0.2
+
+torch.manual_seed(1337)
+
+# Data Augmentation Functions
+def time_stretch(melody, factor=2):
+    return ''.join([note * factor for note in melody])
+
+def drop_notes(melody, drop_prob=0.1):
+    return ''.join([note if random.random() > drop_prob else '' for note in melody])
+
+def adjust_durations(melody, min_duration=1, max_duration=3):
+    return ''.join([note * random.randint(min_duration, max_duration) for note in melody])
+
+# Load and augment melody data
+with open('inputMelodiesAugmented.txt', 'r', encoding='utf-8') as f:
+    melody_text = f.read()
+
+# Apply data augmentations
+augmented_melodies = []
+for melody in melody_text.splitlines():
+    stretched = time_stretch(melody)
+    dropped = drop_notes(stretched)
+    adjusted = adjust_durations(dropped)
+    augmented_melodies.append(adjusted)
+
+# Save augmented data to a new file
+with open('augmentedMelodiesFinal.txt', 'w', encoding='utf-8') as f:
+    f.write('\n'.join(augmented_melodies))
+
+# Map musical tokens to integers
+chars = sorted(list(set(''.join(augmented_melodies))))
+vocab_size = len(chars)
+stoi = {ch: i for i, ch in enumerate(chars)}
+itos = {i: ch for i, ch in enumerate(chars)}
+encode = lambda s: [stoi[c] for c in s]
+decode = lambda l: ''.join([itos[i] for i in l])
+
+# Prepare dataset
+data = torch.tensor(encode(''.join(augmented_melodies)), dtype=torch.long)
+n = int(0.9 * len(data))
+train_data = data[:n]
+val_data = data[n:]
+
+# Data loading
+def get_batch(split):
+    data = train_data if split == 'train' else val_data
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([data[i:i+block_size] for i in ix])
+    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
+    return x.to(device), y.to(device)
+
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iters)
+        for k in tqdm(range(eval_iters), desc=f"Evaluating {split} split"):
+            X, Y = get_batch(split)
+            logits, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
+
+# Define the GPT-based Melody Model
+class GPTMelodyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+
+        # Transformer blocks
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size)
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        tok_emb = self.token_embedding_table(idx)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device))
+        x = tok_emb + pos_emb
+
+        # Transformer blocks
+        x = self.blocks(x)
+        x = self.ln_f(x)
+
+        # Final layer
+        logits = self.lm_head(x)
+
+        if targets is None:
+            return logits, None
+        loss = label_smoothed_nll_loss(F.log_softmax(logits, dim=-1), targets)
+        return logits, loss.mean()  # Ensure the loss is a scalar by calling .mean()
+
+    def generate(self, idx, max_new_tokens):
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -block_size:]
+            logits, _ = self(idx_cond)
+            probs = F.softmax(logits[:, -1, :], dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+        return idx
+
+# Define Transformer components
+class Head(nn.Module):
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)
+        q = self.query(x)
+        wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
+        v = self.value(x)
+        return wei @ v
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(head_size * num_heads, n_embd)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.dropout(self.proj(torch.cat([h(x) for h in self.heads], dim=-1)))
+
+class FeedFoward(nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedFoward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        return x + self.ffwd(self.ln2(x + self.sa(self.ln1(x))))
+
+# Define the label-smoothed negative log-likelihood loss function
+def label_smoothed_nll_loss(lprobs, target, eps=0.1):
+    nll_loss = -lprobs.gather(dim=-1, index=target.unsqueeze(-1))
+    nll_loss = nll_loss.squeeze(-1)
+    nll_loss = nll_loss.mean()  # Reduce the loss to a scalar value
+    smooth_loss = -lprobs.mean(dim=-1)
+    loss = (1. - eps) * nll_loss + eps * smooth_loss
+    return loss
+
+# Evaluation metrics
+def compute_perplexity(logits, targets):
+    log_probs = F.log_softmax(logits, dim=-1)
+    nll_loss = F.cross_entropy(log_probs.view(-1, logits.size(-1)), targets.view(-1), reduction='none')
+    perplexity = torch.exp(nll_loss.mean())  # Perplexity is exp of the average NLL
+    return perplexity.item()
+
+def compute_levenshtein(prediction, target):
+    return levenshtein_distance(prediction, target)
+
+def compute_jaccard_index(prediction, target):
+    set_pred = set(prediction)
+    set_target = set(target)
+    intersection = set_pred.intersection(set_target)
+    union = set_pred.union(set_target)
+    return len(intersection) / len(union)
+
+# Initialize and train the model
+model = GPTMelodyModel().to(device)
+optimizer = AdamW(model.parameters(), lr=learning_rate)
+
+# Training loop
+best_val_loss = float('inf')
+for iter in tqdm(range(max_iters), desc="Training"):
+    if iter % eval_interval == 0 or iter == max_iters - 1:
+        losses = estimate_loss()
+        print(f"Step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+
+        # Evaluation on validation set
+        model.eval()
+        val_predictions = []
+        val_targets = []
+        for _ in range(eval_iters):
+            X, Y = get_batch('val')
+            logits, _ = model(X, Y)
+            predicted_ids = torch.argmax(logits, dim=-1)
+            val_predictions.extend([decode(prediction.tolist()) for prediction in predicted_ids])
+            val_targets.extend([decode(target.tolist()) for target in Y])
+
+        # Compute Evaluation Metrics
+        levenshtein_scores = [compute_levenshtein(pred, target) for pred, target in zip(val_predictions, val_targets)]
+        perplexities = [compute_perplexity(logits, Y) for _ in range(eval_iters)]
+        jaccard_indices = [compute_jaccard_index(pred, target) for pred, target in zip(val_predictions, val_targets)]
+
+        avg_levenshtein = np.mean(levenshtein_scores)
+        avg_perplexity = np.mean(perplexities)
+        avg_jaccard = np.mean(jaccard_indices)
+
+        print(f"Validation Levenshtein: {avg_levenshtein:.4f}, Perplexity: {avg_perplexity:.4f}, Jaccard Index: {avg_jaccard:.4f}")
+
+    xb, yb = get_batch('train')
+    logits, loss = model(xb, yb)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+# Generate melody
+context = torch.zeros((1, 1), dtype=torch.long, device=device)
+generated = decode(model.generate(context, max_new_tokens=500)[0].tolist())
+print("Generated melody:", generated)
